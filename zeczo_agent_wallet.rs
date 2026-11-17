@@ -8,6 +8,11 @@
 //! the address is blocked, and (when paying an @name) that member's address. If ZECZO can't be reached, nothing is sent.
 //! Each payment carries the ZECZO fee (1%) as a second output of the same transaction.
 //!
+//! Rewards link (off unless the member turns on "Share fees with my inviters" in ZECZO): the tool makes a one-way
+//! tag from the key and asks ZECZO whether that tag is switched on. Only if it is does the tool report each payment
+//! (amount, fee, recipient address, transaction) so the fee is shared with the member's inviters. Otherwise it
+//! reports nothing and ZECZO can't tell whose payments these are.
+//!
 //!   zeczo_agent_wallet setup      read the 24 words from stdin once and save them (file readable only by you)
 //!   zeczo_agent_wallet            run as a tool server (what the agent starts)
 //!
@@ -87,12 +92,14 @@ fn setup() -> Result<(), String> {
     Ok(())
 }
 
-struct Wallet { w: Engine<Channel>, seed: Vec<u8> }
+struct Wallet { w: Engine<Channel>, seed: Vec<u8>, tag: String }
 impl Wallet {
     async fn open() -> Result<Self, String> {
         let phrase = env("ZECZO_AGENT_KEY").or_else(|| std::fs::read_to_string(dir().join("key")).ok())
             .ok_or("No Agent Wallet key yet. Run `zeczo_agent_wallet setup` and paste the key from ZECZO (Agent Wallet → Key for agent).")?;
-        let seed = seed_from_phrase(phrase.trim())?;
+        let phrase = phrase.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        let tag = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(format!("zeczo agent wallet rewards tag:{phrase}").as_bytes())) };
+        let seed = seed_from_phrase(&phrase)?;
         let seed = seed.expose_secret().to_vec();
         let network = match env("ZECZO_NETWORK").as_deref() { Some("test") => Network::TestNetwork, _ => Network::MainNetwork };
         let url = env("LIGHTWALLETD").unwrap_or_else(|| "https://zec.rocks:443".into());
@@ -106,7 +113,7 @@ impl Wallet {
             let birthday = match env("ZECZO_BIRTHDAY") { Some(b) => b.parse().map_err(|_| "bad ZECZO_BIRTHDAY")?, None if network == Network::MainNetwork => FIRST_AGENT_WALLET_HEIGHT, None => w.latest_height().await? - 10 };
             w.create_account(&seed, birthday).await?;
         }
-        Ok(Self { w, seed })
+        Ok(Self { w, seed, tag })
     }
     async fn sync(&mut self) -> Result<(), String> {
         self.w.sync().await?;
@@ -153,7 +160,13 @@ impl Wallet {
                 std::fs::write(dir().join("wallet.db"), self.w.to_bytes()?).map_err(|e| e.to_string())?;
                 let txid = txids.first().cloned().unwrap_or_default();
                 log_payment(&to, zat, &txid);
-                Ok(format!("Sent {} ZEC to {}. ZECZO fee {} ZEC. Transaction {}. Payments are final.", zec(zat), shown, zec(fee), txid))
+                // Rewards link: report this payment only if the member switched sharing on for this wallet.
+                let mut shared = "";
+                if fee > 0 && ask(format!("link/{}", self.tag), None).await.map(|v| v["linked"].as_bool() == Some(true)).unwrap_or(false) {
+                    let body = json!({ "tag": self.tag, "txid": txid, "amountZat": zat.to_string(), "feeZat": fee.to_string(), "to": to });
+                    if ask("fee".into(), Some(body)).await.map(|v| v["recorded"].as_bool() == Some(true)).unwrap_or(false) { shared = " Fee shared with your inviters."; }
+                }
+                Ok(format!("Sent {} ZEC to {}. ZECZO fee {} ZEC.{} Transaction {}. Payments are final.", zec(zat), shown, zec(fee), shared, txid))
             }
             _ => Err(format!("Unknown tool: {name}")),
         }
